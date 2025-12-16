@@ -64,6 +64,15 @@ contract GMCLandCompensation is ERC20, Ownable, ReentrancyGuard {
     mapping(address => string[]) public walletPlots;
 
     // -------------------------
+    // Plot Indexing (for frontend listing)
+    // -------------------------
+    // Holds every registered plotId (append-only for demo)
+    string[] public allPlotIds;
+
+    // plotId => index+1 in allPlotIds (0 means "not indexed")
+    mapping(string => uint256) private plotIndexPlus1;
+
+    // -------------------------
     // Token origin tracking (per user, per plot)
     // -------------------------
 
@@ -241,6 +250,12 @@ contract GMCLandCompensation is ERC20, Ownable, ReentrancyGuard {
         lp.wallet = wallet;
         lp.exists = true;
 
+        // index plotId for global listing (append-only)
+        if (plotIndexPlus1[plotId] == 0) {
+            allPlotIds.push(plotId);
+            plotIndexPlus1[plotId] = allPlotIds.length; // store index+1
+        }
+
         // derive tokens from land value
         lp.landValue = landValue;
         uint256 tokenAmount = landValue * tokensPerUnit;
@@ -405,8 +420,28 @@ contract GMCLandCompensation is ERC20, Ownable, ReentrancyGuard {
     // User Dashboard Helper
     // -------------------------
 
-    function getWalletPlots(address wallet) external view returns (string[] memory) {
+    function getWalletPlots(
+        address wallet
+    ) external view returns (string[] memory) {
         return walletPlots[wallet];
+    }
+
+    // ✅ New getters for global plot listing
+    function getAllPlotIds() external view returns (string[] memory) {
+        return allPlotIds;
+    }
+
+    function getPlotCount() external view returns (uint256) {
+        return allPlotIds.length;
+    }
+
+    function getPlotIdAt(uint256 index) external view returns (string memory) {
+        require(index < allPlotIds.length, "Index out of bounds");
+        return allPlotIds[index];
+    }
+
+    function isPlotIndexed(string memory plotId) external view returns (bool) {
+        return plotIndexPlus1[plotId] != 0;
     }
 
     struct LandPlotView {
@@ -554,5 +589,40 @@ contract GMCLandCompensation is ERC20, Ownable, ReentrancyGuard {
 
             idx++;
         }
+    }
+
+    function getAllPlotsForAdmin()
+        external
+        view
+        returns (LandPlotView[] memory)
+    {
+        uint256 count = allPlotIds.length;
+        LandPlotView[] memory result = new LandPlotView[](count);
+
+        for (uint256 i = 0; i < count; i++) {
+            string memory pid = allPlotIds[i];
+            LandPlot storage p = plots[pid];
+
+            result[i] = LandPlotView({
+                plotId: p.plotId,
+                dzongkhag: p.dzongkhag,
+                gewog: p.gewog,
+                thram: p.thram,
+                ownerName: p.ownerName,
+                ownerCid: p.ownerCid,
+                ownType: p.ownType,
+                majorCategory: p.majorCategory,
+                landType: p.landType,
+                plotClass: p.plotClass,
+                areaAc: p.areaAc,
+                landValue: p.landValue,
+                allocatedTokens: p.allocatedTokens,
+                myTokensFromThisPlot: 0, // admin context
+                wallet: p.wallet,
+                exists: p.exists
+            });
+        }
+
+        return result;
     }
 }
