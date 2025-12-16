@@ -15,6 +15,26 @@ import {
 
 contract GMCLandCompensation is ERC20, Ownable, ReentrancyGuard {
     // -------------------------
+    // Global Token ↔ Land Value Rate
+    // -------------------------
+    /**
+     * tokensPerUnit:
+     * - Simple demo parameter: how many GMCLT tokens are minted
+     *   per 1 unit of land value.
+     * - You decide what "unit" means off-chain (e.g. Nu / 1,000 Nu / 10,000 Nu).
+     */
+    uint256 public tokensPerUnit;
+
+    event TokensPerUnitUpdated(uint256 oldRate, uint256 newRate);
+
+    function setTokensPerUnit(uint256 _tokensPerUnit) external onlyOwner {
+        require(_tokensPerUnit > 0, "Rate must be > 0");
+        uint256 old = tokensPerUnit;
+        tokensPerUnit = _tokensPerUnit;
+        emit TokensPerUnitUpdated(old, _tokensPerUnit);
+    }
+
+    // -------------------------
     // Land Plot Registry
     // -------------------------
 
@@ -30,19 +50,36 @@ contract GMCLandCompensation is ERC20, Ownable, ReentrancyGuard {
         string landType; // e.g. "Urban Core"
         string plotClass; // e.g. "Urban Core" or "CLASS B"
         uint256 areaAc; // e.g. 0.051 ac * 1e4 = 510
-        uint256 allocatedTokens;
-        address wallet; // current wallet mapped for this plot
+        // land valuation and derived tokens
+        uint256 landValue; // demo: arbitrary "value" unit you decide off-chain
+        uint256 allocatedTokens; // total tokens minted for this plot based on landValue
+        address wallet; // current registered wallet mapped for this plot
         bool exists;
     }
 
-    // Mapping of plotId to details (public → auto getter)
+    // plotId → LandPlot
     mapping(string => LandPlot) public plots;
 
-    // For convenience: list plots tied to a wallet
+    // Registered land owner → list of plotIds
     mapping(address => string[]) public walletPlots;
 
-    // 🔹 NEW: total ETH earned from selling tokens (per address)
+    // -------------------------
+    // Token origin tracking (per user, per plot)
+    // -------------------------
+
+    // How many tokens an address currently holds that originated from a given plot
+    mapping(address => mapping(string => uint256)) public tokensFromPlot;
+
+    // List of plotIds for which a holder has (or had) tokens – used for iteration
+    mapping(address => string[]) private tokenPlots;
+    mapping(address => mapping(string => bool)) private hasTokenFromPlot;
+
+    // Total ETH earned from token sales (per address)
     mapping(address => uint256) public totalProceeds;
+
+    // How many tokens a user has bought/sold via the marketplace
+    mapping(address => uint256) public tokensBought;
+    mapping(address => uint256) public tokensSold;
 
     // -------------------------
     // Events
@@ -51,6 +88,7 @@ contract GMCLandCompensation is ERC20, Ownable, ReentrancyGuard {
     event LandPlotRegistered(
         string indexed plotId,
         address indexed wallet,
+        uint256 landValue,
         uint256 tokenAmount
     );
     event LandPlotUpdated(string indexed plotId, address indexed newWallet);
@@ -97,14 +135,76 @@ contract GMCLandCompensation is ERC20, Ownable, ReentrancyGuard {
     constructor(
         address initialOwner
     ) ERC20("GMC Land Token", "GMCLT") Ownable(initialOwner) {
-        // Optional: pre-mint demo supply to owner
+        // Optional: pre-mint demo supply to owner (not tracked per-plot)
         // _mint(initialOwner, 1_000_000 * 1e18);
+    }
+
+    // -------------------------
+    // Internal helpers for plot-token tracking
+    // -------------------------
+
+    function _addTokensFromPlot(
+        address account,
+        string memory plotId,
+        uint256 amount
+    ) internal {
+        if (amount == 0) return;
+
+        tokensFromPlot[account][plotId] += amount;
+
+        if (!hasTokenFromPlot[account][plotId]) {
+            hasTokenFromPlot[account][plotId] = true;
+            tokenPlots[account].push(plotId);
+        }
+    }
+
+    function _moveTokensAcrossPlots(
+        address from,
+        address to,
+        uint256 amount
+    ) internal {
+        uint256 remaining = amount;
+        string[] storage plotsList = tokenPlots[from];
+
+        for (uint256 i = 0; i < plotsList.length && remaining > 0; i++) {
+            string memory plotId = plotsList[i];
+            uint256 bal = tokensFromPlot[from][plotId];
+            if (bal == 0) continue;
+
+            uint256 toMove = bal > remaining ? remaining : bal;
+
+            tokensFromPlot[from][plotId] = bal - toMove;
+            _addTokensFromPlot(to, plotId, toMove);
+
+            remaining -= toMove;
+        }
+        // If remaining > 0, those tokens were never tagged to any plot
+        // (e.g. minted via adminMint). They still transfer fine as ERC20.
+    }
+
+    // Override ERC20 internal hook to keep per-plot balances in sync on transfers
+    function _update(
+        address from,
+        address to,
+        uint256 value
+    ) internal override {
+        if (from != address(0) && to != address(0) && value > 0) {
+            _moveTokensAcrossPlots(from, to, value);
+        }
+
+        super._update(from, to, value);
     }
 
     // -------------------------
     // Land Plot Functions (ADMIN)
     // -------------------------
 
+    /**
+     * Register a land plot and automatically derive tokens
+     * from its landValue and the global tokensPerUnit rate.
+     *
+     * @param landValue demo value (e.g. 1 unit = 1,000 Nu)
+     */
     function registerLandPlot(
         string memory plotId,
         string memory dzongkhag,
@@ -117,11 +217,13 @@ contract GMCLandCompensation is ERC20, Ownable, ReentrancyGuard {
         string memory landType,
         string memory plotClass,
         uint256 areaAcTimes1e4,
-        address wallet,
-        uint256 initialTokenAmount
+        uint256 landValue,
+        address wallet
     ) external onlyOwner {
         require(!plots[plotId].exists, "Plot already exists");
         require(wallet != address(0), "Invalid wallet");
+        require(tokensPerUnit > 0, "Token rate not set");
+        require(landValue > 0, "Land value must be > 0");
 
         LandPlot storage lp = plots[plotId];
 
@@ -139,14 +241,19 @@ contract GMCLandCompensation is ERC20, Ownable, ReentrancyGuard {
         lp.wallet = wallet;
         lp.exists = true;
 
-        if (initialTokenAmount > 0) {
-            lp.allocatedTokens = initialTokenAmount;
-            _mint(wallet, initialTokenAmount);
+        // derive tokens from land value
+        lp.landValue = landValue;
+        uint256 tokenAmount = landValue * tokensPerUnit;
+        lp.allocatedTokens = tokenAmount;
+
+        if (tokenAmount > 0) {
+            _mint(wallet, tokenAmount);
+            _addTokensFromPlot(wallet, plotId, tokenAmount);
         }
 
         walletPlots[wallet].push(plotId);
 
-        emit LandPlotRegistered(plotId, wallet, initialTokenAmount);
+        emit LandPlotRegistered(plotId, wallet, landValue, tokenAmount);
     }
 
     function updatePlotWallet(
@@ -164,6 +271,10 @@ contract GMCLandCompensation is ERC20, Ownable, ReentrancyGuard {
         emit LandPlotUpdated(plotId, newWallet);
     }
 
+    /**
+     * Optional extra minting from a plot (manual top-up).
+     * Still allowed for demo flexibility.
+     */
     function allocateTokensFromPlot(
         string memory plotId,
         address toWallet,
@@ -177,6 +288,7 @@ contract GMCLandCompensation is ERC20, Ownable, ReentrancyGuard {
 
         lp.allocatedTokens += amount;
         _mint(toWallet, amount);
+        _addTokensFromPlot(toWallet, plotId, amount);
 
         emit TokensAllocatedFromPlot(plotId, toWallet, amount);
     }
@@ -221,7 +333,7 @@ contract GMCLandCompensation is ERC20, Ownable, ReentrancyGuard {
             "Not enough tokens in order"
         );
 
-        // FIX: adjust for decimals (18)
+        // Simple pricing: totalCost = amountToBuy * pricePerTokenWei / 1e18
         uint256 totalCost = (amountToBuy * order.pricePerTokenWei) / 1e18;
         require(msg.value >= totalCost, "Insufficient payment");
 
@@ -230,13 +342,19 @@ contract GMCLandCompensation is ERC20, Ownable, ReentrancyGuard {
             order.active = false;
         }
 
+        // Transfer tokens from contract to buyer.
         _transfer(address(this), msg.sender, amountToBuy);
 
+        // Track ETH and token volumes
         totalProceeds[order.seller] += totalCost;
+        tokensBought[msg.sender] += amountToBuy;
+        tokensSold[order.seller] += amountToBuy;
 
+        // Pay seller
         (bool sent, ) = order.seller.call{value: totalCost}("");
         require(sent, "Payment to seller failed");
 
+        // Refund any excess ETH
         uint256 excess = msg.value - totalCost;
         if (excess > 0) {
             (bool refunded, ) = msg.sender.call{value: excess}("");
@@ -266,9 +384,11 @@ contract GMCLandCompensation is ERC20, Ownable, ReentrancyGuard {
     // -------------------------
     // Admin Mint/Burn
     // -------------------------
+    // NOTE: Tokens minted here are NOT tagged to any plot.
 
     function adminMint(address to, uint256 amount) external onlyOwner {
         _mint(to, amount);
+        // not tagged to any plot on purpose
     }
 
     function adminBurn(address from, uint256 amount) external onlyOwner {
@@ -285,6 +405,10 @@ contract GMCLandCompensation is ERC20, Ownable, ReentrancyGuard {
     // User Dashboard Helper
     // -------------------------
 
+    function getWalletPlots(address wallet) external view returns (string[] memory) {
+        return walletPlots[wallet];
+    }
+
     struct LandPlotView {
         string plotId;
         string dzongkhag;
@@ -297,8 +421,10 @@ contract GMCLandCompensation is ERC20, Ownable, ReentrancyGuard {
         string landType;
         string plotClass;
         uint256 areaAc;
-        uint256 allocatedTokens;
-        address wallet;
+        uint256 landValue;
+        uint256 allocatedTokens; // total minted for this plot (all holders)
+        uint256 myTokensFromThisPlot; // how many tokens caller (or user) currently holds from this plot
+        address wallet; // registered land wallet
         bool exists;
     }
 
@@ -307,29 +433,43 @@ contract GMCLandCompensation is ERC20, Ownable, ReentrancyGuard {
         view
         returns (
             uint256 tokenBalance,
-            uint256 totalEarned, // 🔹 NEW: total ETH earned from selling
+            uint256 totalEarned,
+            uint256 totalTokensBought,
+            uint256 totalTokensSold,
             string[] memory myPlots,
             LandPlotView[] memory fullPlotDetails
         )
     {
         address user = msg.sender;
 
-        // 1. Token balance
         tokenBalance = balanceOf(user);
-
-        // 2. Total ETH earned from sales
         totalEarned = totalProceeds[user];
+        totalTokensBought = tokensBought[user];
+        totalTokensSold = tokensSold[user];
 
-        // 3. List of plot IDs linked to this wallet
-        myPlots = walletPlots[user];
+        string[] storage allPlots = tokenPlots[user];
 
-        // 4. Build full plot details array
-        fullPlotDetails = new LandPlotView[](myPlots.length);
+        uint256 count = 0;
+        for (uint256 i = 0; i < allPlots.length; i++) {
+            string memory pid = allPlots[i];
+            if (tokensFromPlot[user][pid] > 0) {
+                count++;
+            }
+        }
 
-        for (uint256 i = 0; i < myPlots.length; i++) {
-            LandPlot storage p = plots[myPlots[i]];
+        myPlots = new string[](count);
+        fullPlotDetails = new LandPlotView[](count);
 
-            fullPlotDetails[i] = LandPlotView({
+        uint256 idx = 0;
+        for (uint256 i = 0; i < allPlots.length; i++) {
+            string memory pid = allPlots[i];
+            uint256 myBalFromPlot = tokensFromPlot[user][pid];
+            if (myBalFromPlot == 0) continue;
+
+            LandPlot storage p = plots[pid];
+
+            myPlots[idx] = pid;
+            fullPlotDetails[idx] = LandPlotView({
                 plotId: p.plotId,
                 dzongkhag: p.dzongkhag,
                 gewog: p.gewog,
@@ -341,10 +481,78 @@ contract GMCLandCompensation is ERC20, Ownable, ReentrancyGuard {
                 landType: p.landType,
                 plotClass: p.plotClass,
                 areaAc: p.areaAc,
+                landValue: p.landValue,
                 allocatedTokens: p.allocatedTokens,
+                myTokensFromThisPlot: myBalFromPlot,
                 wallet: p.wallet,
                 exists: p.exists
             });
+
+            idx++;
+        }
+    }
+
+    function getUserPlotBreakdown(
+        address user
+    )
+        external
+        view
+        returns (
+            uint256 tokenBalance,
+            uint256 totalEarned,
+            uint256 totalTokensBought,
+            uint256 totalTokensSold,
+            string[] memory plotIds,
+            LandPlotView[] memory plotDetails
+        )
+    {
+        tokenBalance = balanceOf(user);
+        totalEarned = totalProceeds[user];
+        totalTokensBought = tokensBought[user];
+        totalTokensSold = tokensSold[user];
+
+        string[] storage allPlots = tokenPlots[user];
+
+        uint256 count = 0;
+        for (uint256 i = 0; i < allPlots.length; i++) {
+            string memory pid = allPlots[i];
+            if (tokensFromPlot[user][pid] > 0) {
+                count++;
+            }
+        }
+
+        plotIds = new string[](count);
+        plotDetails = new LandPlotView[](count);
+
+        uint256 idx = 0;
+        for (uint256 i = 0; i < allPlots.length; i++) {
+            string memory pid = allPlots[i];
+            uint256 myBalFromPlot = tokensFromPlot[user][pid];
+            if (myBalFromPlot == 0) continue;
+
+            LandPlot storage p = plots[pid];
+
+            plotIds[idx] = pid;
+            plotDetails[idx] = LandPlotView({
+                plotId: p.plotId,
+                dzongkhag: p.dzongkhag,
+                gewog: p.gewog,
+                thram: p.thram,
+                ownerName: p.ownerName,
+                ownerCid: p.ownerCid,
+                ownType: p.ownType,
+                majorCategory: p.majorCategory,
+                landType: p.landType,
+                plotClass: p.plotClass,
+                areaAc: p.areaAc,
+                landValue: p.landValue,
+                allocatedTokens: p.allocatedTokens,
+                myTokensFromThisPlot: myBalFromPlot,
+                wallet: p.wallet,
+                exists: p.exists
+            });
+
+            idx++;
         }
     }
 }
