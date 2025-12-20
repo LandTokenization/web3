@@ -44,9 +44,9 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
     });
 
     it("reverts when setting tokensPerUnit to zero", async () => {
-      await expect(
-        token.setTokensPerUnit(0)
-      ).to.be.revertedWith("Rate must be > 0");
+      await expect(token.setTokensPerUnit(0)).to.be.revertedWith(
+        "Rate must be > 0"
+      );
     });
   });
 
@@ -55,21 +55,24 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
       const landValue = 5n;
       const expectedTokens = landValue * ONE_TOKEN;
 
-      await expect(token.registerLandPlot(
-        "GT1-0001",
-        "Gelephu",
-        "Gelephu Throm",
-        "2583",
-        "Sonia Ghalay",
-        "12008000663",
-        "Family Ownership",
-        "Private",
-        "Urban Core",
-        "CLASS A",
-        510n,
-        landValue,
-        user1.address
-      )).to.emit(token, "LandPlotRegistered")
+      await expect(
+        token.registerLandPlot(
+          "GT1-0001",
+          "Gelephu",
+          "Gelephu Throm",
+          "2583",
+          "Sonia Ghalay",
+          "12008000663",
+          "Family Ownership",
+          "Private",
+          "Urban Core",
+          "CLASS A",
+          510n,
+          landValue,
+          user1.address
+        )
+      )
+        .to.emit(token, "LandPlotRegistered")
         .withArgs("GT1-0001", user1.address, landValue, expectedTokens);
 
       const bal = await token.balanceOf(user1.address);
@@ -82,7 +85,10 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
       expect(plot.wallet).to.equal(user1.address);
       expect(plot.ownerName).to.equal("Sonia Ghalay");
 
-      const tokensFromPlot = await token.tokensFromPlot(user1.address, "GT1-0001");
+      const tokensFromPlot = await token.tokensFromPlot(
+        user1.address,
+        "GT1-0001"
+      );
       expect(tokensFromPlot).to.equal(expectedTokens);
 
       const walletPlots = await token.walletPlots(user1.address, 0);
@@ -256,9 +262,131 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
     });
 
     it("reverts when updating non-existent plot", async () => {
+      await expect(token.updatePlotWallet("FAKE-PLOT", user1.address)).to.be
+        .revertedWith("Plot not found");
+    });
+  });
+
+  // ✅ NEW: Inheritance / Nominee (Option A)
+  // Assumes you added:
+  // - setNomineeForPlot(plotId, nominee)
+  // - declarePlotOwnerDeceased(plotId)
+  // - claimPlotAsNominee(plotId, newWallet)
+  // - events: NomineeSet, OwnerDeclaredDeceased, PlotClaimedByNominee
+  // - mapping: inheritancePlans(plotId) -> { nominee, status, ... }
+  // - enum status: NONE=0, ACTIVE=1, DECEASED=2, CLAIMED=3
+  describe("Inheritance / Nominee (Option A)", () => {
+    beforeEach(async () => {
+      await token.registerLandPlot(
+        "GT1-INHERIT-1",
+        "Gelephu",
+        "Gelephu Throm",
+        "9991",
+        "Original Owner",
+        "11111111111",
+        "Family",
+        "Private",
+        "Urban Core",
+        "CLASS A",
+        510n,
+        5n,
+        user1.address
+      );
+    });
+
+    it("plot wallet can set nominee for a plot", async () => {
       await expect(
-        token.updatePlotWallet("FAKE-PLOT", user1.address)
-      ).to.be.revertedWith("Plot not found");
+        token.connect(user1).setNomineeForPlot("GT1-INHERIT-1", user2.address)
+      )
+        .to.emit(token, "NomineeSet")
+        .withArgs("GT1-INHERIT-1", user1.address, user2.address);
+
+      const plan = await token.inheritancePlans("GT1-INHERIT-1");
+      expect(plan.nominee).to.equal(user2.address);
+      expect(plan.status).to.equal(1n); // ACTIVE
+    });
+
+    it("reverts when non-plot-wallet tries to set nominee", async () => {
+      await expect(
+        token.connect(user3).setNomineeForPlot("GT1-INHERIT-1", user2.address)
+      ).to.be.revertedWith("Only plot wallet");
+    });
+
+    it("reverts when setting nominee to zero address", async () => {
+      await expect(
+        token
+          .connect(user1)
+          .setNomineeForPlot("GT1-INHERIT-1", ethers.ZeroAddress)
+      ).to.be.revertedWith("Invalid nominee");
+    });
+
+    it("admin can declare plot owner deceased (after nominee set)", async () => {
+      await token.connect(user1).setNomineeForPlot("GT1-INHERIT-1", user2.address);
+
+      await expect(token.declarePlotOwnerDeceased("GT1-INHERIT-1"))
+        .to.emit(token, "OwnerDeclaredDeceased")
+        .withArgs("GT1-INHERIT-1", owner.address, user2.address);
+
+      const plan = await token.inheritancePlans("GT1-INHERIT-1");
+      expect(plan.status).to.equal(2n); // DECEASED
+    });
+
+    it("reverts when non-owner declares deceased", async () => {
+      await token.connect(user1).setNomineeForPlot("GT1-INHERIT-1", user2.address);
+
+      await expect(
+        token.connect(user1).declarePlotOwnerDeceased("GT1-INHERIT-1")
+      ).to.be.revertedWithCustomError(token, "OwnableUnauthorizedAccount");
+    });
+
+    it("reverts when declaring deceased without active nominee", async () => {
+      await expect(token.declarePlotOwnerDeceased("GT1-INHERIT-1")).to.be
+        .revertedWith("No active nominee");
+    });
+
+    it("nominee can claim plot and set new wallet after deceased", async () => {
+      await token.connect(user1).setNomineeForPlot("GT1-INHERIT-1", user2.address);
+      await token.declarePlotOwnerDeceased("GT1-INHERIT-1");
+
+      await expect(
+        token.connect(user2).claimPlotAsNominee("GT1-INHERIT-1", user3.address)
+      )
+        .to.emit(token, "PlotClaimedByNominee")
+        .withArgs("GT1-INHERIT-1", user2.address, user1.address, user3.address);
+
+      const plot = await token.plots("GT1-INHERIT-1");
+      expect(plot.wallet).to.equal(user3.address);
+
+      const plan = await token.inheritancePlans("GT1-INHERIT-1");
+      expect(plan.status).to.equal(3n); // CLAIMED
+    });
+
+    it("reverts when non-nominee tries to claim", async () => {
+      await token.connect(user1).setNomineeForPlot("GT1-INHERIT-1", user2.address);
+      await token.declarePlotOwnerDeceased("GT1-INHERIT-1");
+
+      await expect(
+        token.connect(user3).claimPlotAsNominee("GT1-INHERIT-1", user3.address)
+      ).to.be.revertedWith("Only nominee");
+    });
+
+    it("reverts when claiming before deceased declaration", async () => {
+      await token.connect(user1).setNomineeForPlot("GT1-INHERIT-1", user2.address);
+
+      await expect(
+        token.connect(user2).claimPlotAsNominee("GT1-INHERIT-1", user3.address)
+      ).to.be.revertedWith("Not claimable");
+    });
+
+    it("reverts when claiming with zero new wallet", async () => {
+      await token.connect(user1).setNomineeForPlot("GT1-INHERIT-1", user2.address);
+      await token.declarePlotOwnerDeceased("GT1-INHERIT-1");
+
+      await expect(
+        token
+          .connect(user2)
+          .claimPlotAsNominee("GT1-INHERIT-1", ethers.ZeroAddress)
+      ).to.be.revertedWith("Invalid new wallet");
     });
   });
 
@@ -283,16 +411,20 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
 
     it("allows owner to allocate additional tokens from plot", async () => {
       const additionalTokens = 3n * ONE_TOKEN;
-      
+
       await expect(
         token.allocateTokensFromPlot("GT1-0001", user2.address, additionalTokens)
-      ).to.emit(token, "TokensAllocatedFromPlot")
+      )
+        .to.emit(token, "TokensAllocatedFromPlot")
         .withArgs("GT1-0001", user2.address, additionalTokens);
 
       const bal = await token.balanceOf(user2.address);
       expect(bal).to.equal(additionalTokens);
 
-      const tokensFromPlot = await token.tokensFromPlot(user2.address, "GT1-0001");
+      const tokensFromPlot = await token.tokensFromPlot(
+        user2.address,
+        "GT1-0001"
+      );
       expect(tokensFromPlot).to.equal(additionalTokens);
     });
 
@@ -345,15 +477,20 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
       expect(bal1).to.equal(totalTokens - transferAmount);
       expect(bal2).to.equal(transferAmount);
 
-      const fromPlotUser1 = await token.tokensFromPlot(user1.address, "GT1-0002");
-      const fromPlotUser2 = await token.tokensFromPlot(user2.address, "GT1-0002");
+      const fromPlotUser1 = await token.tokensFromPlot(
+        user1.address,
+        "GT1-0002"
+      );
+      const fromPlotUser2 = await token.tokensFromPlot(
+        user2.address,
+        "GT1-0002"
+      );
 
       expect(fromPlotUser1).to.equal(totalTokens - transferAmount);
       expect(fromPlotUser2).to.equal(transferAmount);
     });
 
     it("handles transfer when sender has tokens from multiple plots", async () => {
-      // Register two plots for user1
       await token.registerLandPlot(
         "GT1-MULTI-1",
         "Gelephu",
@@ -387,7 +524,7 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
       );
 
       const totalTokens = 12n * ONE_TOKEN;
-      const transferAmount = 8n * ONE_TOKEN; // More than first plot
+      const transferAmount = 8n * ONE_TOKEN;
 
       await token.connect(user1).transfer(user2.address, transferAmount);
 
@@ -397,9 +534,14 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
       expect(bal1).to.equal(totalTokens - transferAmount);
       expect(bal2).to.equal(transferAmount);
 
-      // Check plot breakdown for user2
-      const fromPlot1User2 = await token.tokensFromPlot(user2.address, "GT1-MULTI-1");
-      const fromPlot2User2 = await token.tokensFromPlot(user2.address, "GT1-MULTI-2");
+      const fromPlot1User2 = await token.tokensFromPlot(
+        user2.address,
+        "GT1-MULTI-1"
+      );
+      const fromPlot2User2 = await token.tokensFromPlot(
+        user2.address,
+        "GT1-MULTI-2"
+      );
 
       expect(fromPlot1User2).to.equal(5n * ONE_TOKEN);
       expect(fromPlot2User2).to.equal(3n * ONE_TOKEN);
@@ -444,9 +586,13 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
       const amountToSell = 5n * ONE_TOKEN;
       const pricePerTokenWei = ONE_ETHER;
 
-      const tx = await token.connect(user1).createSellOrder(amountToSell, pricePerTokenWei);
+      const tx = await token
+        .connect(user1)
+        .createSellOrder(amountToSell, pricePerTokenWei);
       const rc = await tx.wait();
-      const event = rc.logs.find((l) => l.fragment && l.fragment.name === "SellOrderCreated");
+      const event = rc.logs.find(
+        (l) => l.fragment && l.fragment.name === "SellOrderCreated"
+      );
       const orderId = event.args.orderId;
 
       expect(event.args.seller).to.equal(user1.address);
@@ -465,8 +611,14 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
       expect(balUser1).to.equal(totalTokens - amountToSell);
       expect(balContract).to.equal(amountToSell);
 
-      const fromPlotUser1 = await token.tokensFromPlot(user1.address, "GT1-MARKET");
-      const fromPlotContract = await token.tokensFromPlot(await token.getAddress(), "GT1-MARKET");
+      const fromPlotUser1 = await token.tokensFromPlot(
+        user1.address,
+        "GT1-MARKET"
+      );
+      const fromPlotContract = await token.tokensFromPlot(
+        await token.getAddress(),
+        "GT1-MARKET"
+      );
 
       expect(fromPlotUser1).to.equal(totalTokens - amountToSell);
       expect(fromPlotContract).to.equal(amountToSell);
@@ -489,17 +641,24 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
       const amountToSell = 4n * ONE_TOKEN;
       const pricePerTokenWei = ONE_ETHER;
 
-      const tx = await token.connect(user1).createSellOrder(amountToSell, pricePerTokenWei);
+      const tx = await token
+        .connect(user1)
+        .createSellOrder(amountToSell, pricePerTokenWei);
       const rc = await tx.wait();
-      const event = rc.logs.find((l) => l.fragment && l.fragment.name === "SellOrderCreated");
+      const event = rc.logs.find(
+        (l) => l.fragment && l.fragment.name === "SellOrderCreated"
+      );
       const orderId = event.args.orderId;
 
       const totalCost = (amountToSell * pricePerTokenWei) / DECIMALS_FACTOR;
       const sellerStartEth = await ethers.provider.getBalance(user1.address);
 
       await expect(
-        token.connect(user2).buyFromOrder(orderId, amountToSell, { value: totalCost })
-      ).to.emit(token, "SellOrderFilled")
+        token
+          .connect(user2)
+          .buyFromOrder(orderId, amountToSell, { value: totalCost })
+      )
+        .to.emit(token, "SellOrderFilled")
         .withArgs(orderId, user2.address, amountToSell, totalCost);
 
       const order = await token.sellOrders(orderId);
@@ -522,8 +681,14 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
       expect(tokensBought).to.equal(amountToSell);
       expect(tokensSold).to.equal(amountToSell);
 
-      const fromPlotSeller = await token.tokensFromPlot(user1.address, "GT1-MARKET");
-      const fromPlotBuyer = await token.tokensFromPlot(user2.address, "GT1-MARKET");
+      const fromPlotSeller = await token.tokensFromPlot(
+        user1.address,
+        "GT1-MARKET"
+      );
+      const fromPlotBuyer = await token.tokensFromPlot(
+        user2.address,
+        "GT1-MARKET"
+      );
 
       expect(fromPlotSeller).to.equal(totalTokens - amountToSell);
       expect(fromPlotBuyer).to.equal(amountToSell);
@@ -536,16 +701,21 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
       const amountToSell = 10n * ONE_TOKEN;
       const pricePerTokenWei = ONE_ETHER;
 
-      const tx = await token.connect(user1).createSellOrder(amountToSell, pricePerTokenWei);
+      const tx = await token
+        .connect(user1)
+        .createSellOrder(amountToSell, pricePerTokenWei);
       const rc = await tx.wait();
-      const event = rc.logs.find((l) => l.fragment && l.fragment.name === "SellOrderCreated");
+      const event = rc.logs.find(
+        (l) => l.fragment && l.fragment.name === "SellOrderCreated"
+      );
       const orderId = event.args.orderId;
 
-      // Buy only part of the order
       const partialAmount = 3n * ONE_TOKEN;
       const partialCost = (partialAmount * pricePerTokenWei) / DECIMALS_FACTOR;
 
-      await token.connect(user2).buyFromOrder(orderId, partialAmount, { value: partialCost });
+      await token
+        .connect(user2)
+        .buyFromOrder(orderId, partialAmount, { value: partialCost });
 
       const order = await token.sellOrders(orderId);
       expect(order.amountRemaining).to.equal(amountToSell - partialAmount);
@@ -554,9 +724,11 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
       const balBuyer = await token.balanceOf(user2.address);
       expect(balBuyer).to.equal(partialAmount);
 
-      // Buy the rest
-      const remainingCost = (order.amountRemaining * pricePerTokenWei) / DECIMALS_FACTOR;
-      await token.connect(user3).buyFromOrder(orderId, order.amountRemaining, { value: remainingCost });
+      const remainingCost =
+        (order.amountRemaining * pricePerTokenWei) / DECIMALS_FACTOR;
+      await token
+        .connect(user3)
+        .buyFromOrder(orderId, order.amountRemaining, { value: remainingCost });
 
       const finalOrder = await token.sellOrders(orderId);
       expect(finalOrder.amountRemaining).to.equal(0n);
@@ -567,41 +739,55 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
       const amountToSell = 2n * ONE_TOKEN;
       const pricePerTokenWei = ONE_ETHER;
 
-      const tx = await token.connect(user1).createSellOrder(amountToSell, pricePerTokenWei);
+      const tx = await token
+        .connect(user1)
+        .createSellOrder(amountToSell, pricePerTokenWei);
       const rc = await tx.wait();
-      const event = rc.logs.find((l) => l.fragment && l.fragment.name === "SellOrderCreated");
+      const event = rc.logs.find(
+        (l) => l.fragment && l.fragment.name === "SellOrderCreated"
+      );
       const orderId = event.args.orderId;
 
       const totalCost = (amountToSell * pricePerTokenWei) / DECIMALS_FACTOR;
       const excessAmount = ONE_ETHER;
       const buyerStartEth = await ethers.provider.getBalance(user2.address);
 
-      const buyTx = await token.connect(user2).buyFromOrder(orderId, amountToSell, { 
-        value: totalCost + excessAmount 
-      });
+      const buyTx = await token
+        .connect(user2)
+        .buyFromOrder(orderId, amountToSell, {
+          value: totalCost + excessAmount,
+        });
       const buyReceipt = await buyTx.wait();
       const gasCost = buyReceipt.gasUsed * buyReceipt.gasPrice;
 
       const buyerEndEth = await ethers.provider.getBalance(user2.address);
-      
-      // Buyer should have paid only totalCost + gas, excess should be refunded
-      expect(buyerStartEth - buyerEndEth).to.be.closeTo(totalCost + gasCost, ONE_ETHER / 1000n);
+
+      expect(buyerStartEth - buyerEndEth).to.be.closeTo(
+        totalCost + gasCost,
+        ONE_ETHER / 1000n
+      );
     });
 
     it("reverts when buying with insufficient payment", async () => {
       const amountToSell = 5n * ONE_TOKEN;
       const pricePerTokenWei = ONE_ETHER;
 
-      const tx = await token.connect(user1).createSellOrder(amountToSell, pricePerTokenWei);
+      const tx = await token
+        .connect(user1)
+        .createSellOrder(amountToSell, pricePerTokenWei);
       const rc = await tx.wait();
-      const event = rc.logs.find((l) => l.fragment && l.fragment.name === "SellOrderCreated");
+      const event = rc.logs.find(
+        (l) => l.fragment && l.fragment.name === "SellOrderCreated"
+      );
       const orderId = event.args.orderId;
 
       const totalCost = (amountToSell * pricePerTokenWei) / DECIMALS_FACTOR;
       const insufficientPayment = totalCost - ONE_ETHER;
 
       await expect(
-        token.connect(user2).buyFromOrder(orderId, amountToSell, { value: insufficientPayment })
+        token
+          .connect(user2)
+          .buyFromOrder(orderId, amountToSell, { value: insufficientPayment })
       ).to.be.revertedWith("Insufficient payment");
     });
 
@@ -609,12 +795,15 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
       const amountToSell = 5n * ONE_TOKEN;
       const pricePerTokenWei = ONE_ETHER;
 
-      const tx = await token.connect(user1).createSellOrder(amountToSell, pricePerTokenWei);
+      const tx = await token
+        .connect(user1)
+        .createSellOrder(amountToSell, pricePerTokenWei);
       const rc = await tx.wait();
-      const event = rc.logs.find((l) => l.fragment && l.fragment.name === "SellOrderCreated");
+      const event = rc.logs.find(
+        (l) => l.fragment && l.fragment.name === "SellOrderCreated"
+      );
       const orderId = event.args.orderId;
 
-      // Cancel the order
       await token.connect(user1).cancelSellOrder(orderId);
 
       const totalCost = (amountToSell * pricePerTokenWei) / DECIMALS_FACTOR;
@@ -628,9 +817,13 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
       const amountToSell = 5n * ONE_TOKEN;
       const pricePerTokenWei = ONE_ETHER;
 
-      const tx = await token.connect(user1).createSellOrder(amountToSell, pricePerTokenWei);
+      const tx = await token
+        .connect(user1)
+        .createSellOrder(amountToSell, pricePerTokenWei);
       const rc = await tx.wait();
-      const event = rc.logs.find((l) => l.fragment && l.fragment.name === "SellOrderCreated");
+      const event = rc.logs.find(
+        (l) => l.fragment && l.fragment.name === "SellOrderCreated"
+      );
       const orderId = event.args.orderId;
 
       const excessAmount = 10n * ONE_TOKEN;
@@ -645,9 +838,13 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
       const amountToSell = 5n * ONE_TOKEN;
       const pricePerTokenWei = ONE_ETHER;
 
-      const tx = await token.connect(user1).createSellOrder(amountToSell, pricePerTokenWei);
+      const tx = await token
+        .connect(user1)
+        .createSellOrder(amountToSell, pricePerTokenWei);
       const rc = await tx.wait();
-      const event = rc.logs.find((l) => l.fragment && l.fragment.name === "SellOrderCreated");
+      const event = rc.logs.find(
+        (l) => l.fragment && l.fragment.name === "SellOrderCreated"
+      );
       const orderId = event.args.orderId;
 
       await expect(
@@ -660,9 +857,13 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
       const amountToSell = 4n * ONE_TOKEN;
       const pricePerTokenWei = ONE_ETHER;
 
-      const tx = await token.connect(user1).createSellOrder(amountToSell, pricePerTokenWei);
+      const tx = await token
+        .connect(user1)
+        .createSellOrder(amountToSell, pricePerTokenWei);
       const rc = await tx.wait();
-      const event = rc.logs.find((l) => l.fragment && l.fragment.name === "SellOrderCreated");
+      const event = rc.logs.find(
+        (l) => l.fragment && l.fragment.name === "SellOrderCreated"
+      );
       const orderId = event.args.orderId;
 
       await expect(token.connect(user1).cancelSellOrder(orderId))
@@ -679,7 +880,10 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
       expect(balSeller).to.equal(totalTokens);
       expect(balContract).to.equal(0n);
 
-      const fromPlotSeller = await token.tokensFromPlot(user1.address, "GT1-MARKET");
+      const fromPlotSeller = await token.tokensFromPlot(
+        user1.address,
+        "GT1-MARKET"
+      );
       expect(fromPlotSeller).to.equal(totalTokens);
     });
 
@@ -687,30 +891,36 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
       const amountToSell = 5n * ONE_TOKEN;
       const pricePerTokenWei = ONE_ETHER;
 
-      const tx = await token.connect(user1).createSellOrder(amountToSell, pricePerTokenWei);
+      const tx = await token
+        .connect(user1)
+        .createSellOrder(amountToSell, pricePerTokenWei);
       const rc = await tx.wait();
-      const event = rc.logs.find((l) => l.fragment && l.fragment.name === "SellOrderCreated");
+      const event = rc.logs.find(
+        (l) => l.fragment && l.fragment.name === "SellOrderCreated"
+      );
       const orderId = event.args.orderId;
 
-      await expect(
-        token.connect(user2).cancelSellOrder(orderId)
-      ).to.be.revertedWith("Not your order");
+      await expect(token.connect(user2).cancelSellOrder(orderId)).to.be
+        .revertedWith("Not your order");
     });
 
     it("reverts when cancelling inactive order", async () => {
       const amountToSell = 5n * ONE_TOKEN;
       const pricePerTokenWei = ONE_ETHER;
 
-      const tx = await token.connect(user1).createSellOrder(amountToSell, pricePerTokenWei);
+      const tx = await token
+        .connect(user1)
+        .createSellOrder(amountToSell, pricePerTokenWei);
       const rc = await tx.wait();
-      const event = rc.logs.find((l) => l.fragment && l.fragment.name === "SellOrderCreated");
+      const event = rc.logs.find(
+        (l) => l.fragment && l.fragment.name === "SellOrderCreated"
+      );
       const orderId = event.args.orderId;
 
       await token.connect(user1).cancelSellOrder(orderId);
 
-      await expect(
-        token.connect(user1).cancelSellOrder(orderId)
-      ).to.be.revertedWith("Order not active");
+      await expect(token.connect(user1).cancelSellOrder(orderId)).to.be
+        .revertedWith("Order not active");
     });
   });
 
@@ -731,7 +941,7 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
 
       await token.adminMint(user1.address, mintAmount);
       await token.adminBurn(user1.address, mintAmount / 2n);
-      
+
       const bal = await token.balanceOf(user1.address);
       expect(bal).to.equal(mintAmount / 2n);
     });
@@ -744,7 +954,7 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
 
     it("reverts when non-owner calls adminBurn", async () => {
       await token.adminMint(user1.address, ONE_TOKEN);
-      
+
       await expect(
         token.connect(user1).adminBurn(user1.address, ONE_TOKEN)
       ).to.be.revertedWithCustomError(token, "OwnableUnauthorizedAccount");
@@ -778,7 +988,7 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
         totalTokensBought,
         totalTokensSold,
         myPlots,
-        fullPlotDetails
+        fullPlotDetails,
       ] = await token.connect(user1).getMyInfo();
 
       expect(tokenBalance).to.equal(totalTokens);
@@ -813,26 +1023,28 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
         user1.address
       );
 
-      // Create and complete a sell order
       const amountToSell = 5n * ONE_TOKEN;
       const pricePerTokenWei = ONE_ETHER;
 
-      const tx = await token.connect(user1).createSellOrder(amountToSell, pricePerTokenWei);
+      const tx = await token
+        .connect(user1)
+        .createSellOrder(amountToSell, pricePerTokenWei);
       const rc = await tx.wait();
-      const event = rc.logs.find((l) => l.fragment && l.fragment.name === "SellOrderCreated");
+      const event = rc.logs.find(
+        (l) => l.fragment && l.fragment.name === "SellOrderCreated"
+      );
       const orderId = event.args.orderId;
 
       const totalCost = (amountToSell * pricePerTokenWei) / DECIMALS_FACTOR;
-      await token.connect(user2).buyFromOrder(orderId, amountToSell, { value: totalCost });
+      await token
+        .connect(user2)
+        .buyFromOrder(orderId, amountToSell, { value: totalCost });
 
-      // Check seller info
       const [
         sellerBalance,
         sellerEarned,
         sellerBought,
         sellerSold,
-        sellerPlots,
-        sellerDetails
       ] = await token.connect(user1).getMyInfo();
 
       expect(sellerBalance).to.equal(5n * ONE_TOKEN);
@@ -840,14 +1052,11 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
       expect(sellerBought).to.equal(0n);
       expect(sellerSold).to.equal(amountToSell);
 
-      // Check buyer info
       const [
         buyerBalance,
         buyerEarned,
         buyerBought,
         buyerSold,
-        buyerPlots,
-        buyerDetails
       ] = await token.connect(user2).getMyInfo();
 
       expect(buyerBalance).to.equal(amountToSell);
@@ -892,7 +1101,6 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
         user1.address
       );
 
-      // Move some tokens from second plot to user2
       const transferAmount = 1n * ONE_TOKEN;
       await token.connect(user1).transfer(user2.address, transferAmount);
 
@@ -902,10 +1110,12 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
         totalTokensBought1,
         totalTokensSold1,
         plotIds1,
-        plotDetails1
+        plotDetails1,
       ] = await token.getUserPlotBreakdown(user1.address);
 
-      expect(tokenBalance1).to.equal((landValue1 + landValue2) * ONE_TOKEN - transferAmount);
+      expect(tokenBalance1).to.equal(
+        (landValue1 + landValue2) * ONE_TOKEN - transferAmount
+      );
       expect(totalEarned1).to.equal(0n);
       expect(totalTokensBought1).to.equal(0n);
       expect(totalTokensSold1).to.equal(0n);
@@ -918,7 +1128,7 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
         totalTokensBought2,
         totalTokensSold2,
         plotIds2,
-        plotDetails2
+        plotDetails2,
       ] = await token.getUserPlotBreakdown(user2.address);
 
       expect(tokenBalance2).to.equal(transferAmount);
@@ -927,8 +1137,7 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
       expect(totalTokensSold2).to.equal(0n);
       expect(plotIds2.length).to.equal(1);
       expect(plotDetails2.length).to.equal(1);
-      
-      // Check that user2's tokens come from the last plot (LIFO transfer logic)
+
       expect(plotDetails2[0].myTokensFromThisPlot).to.equal(transferAmount);
     });
 
@@ -951,16 +1160,17 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
         user1.address
       );
 
-      // Transfer all tokens to user2
-      await token.connect(user1).transfer(user2.address, landValue * ONE_TOKEN);
+      await token
+        .connect(user1)
+        .transfer(user2.address, landValue * ONE_TOKEN);
 
       const [
         tokenBalance,
-        totalEarned,
-        totalTokensBought,
-        totalTokensSold,
+        ,
+        ,
+        ,
         myPlots,
-        fullPlotDetails
+        fullPlotDetails,
       ] = await token.connect(user1).getMyInfo();
 
       expect(tokenBalance).to.equal(0n);
@@ -971,7 +1181,6 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
 
   describe("Edge Cases and Integration", () => {
     it("handles complex multi-user multi-plot scenario", async () => {
-      // Register multiple plots
       await token.registerLandPlot(
         "GT1-COMPLEX-1",
         "Gelephu",
@@ -1004,35 +1213,40 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
         user2.address
       );
 
-      // User1 creates sell order
       const sellAmount = 5n * ONE_TOKEN;
-      const pricePerToken = ONE_ETHER / 2n; // 0.5 ETH per token
+      const pricePerToken = ONE_ETHER / 2n;
 
-      const tx = await token.connect(user1).createSellOrder(sellAmount, pricePerToken);
+      const tx = await token
+        .connect(user1)
+        .createSellOrder(sellAmount, pricePerToken);
       const rc = await tx.wait();
-      const event = rc.logs.find((l) => l.fragment && l.fragment.name === "SellOrderCreated");
+      const event = rc.logs.find(
+        (l) => l.fragment && l.fragment.name === "SellOrderCreated"
+      );
       const orderId = event.args.orderId;
 
-      // User3 buys from user1's order
       const buyAmount = 3n * ONE_TOKEN;
       const cost = (buyAmount * pricePerToken) / DECIMALS_FACTOR;
       await token.connect(user3).buyFromOrder(orderId, buyAmount, { value: cost });
 
-      // User2 transfers some tokens to user3
       await token.connect(user2).transfer(user3.address, 5n * ONE_TOKEN);
 
-      // Verify final balances
       const bal1 = await token.balanceOf(user1.address);
       const bal2 = await token.balanceOf(user2.address);
       const bal3 = await token.balanceOf(user3.address);
 
-      expect(bal1).to.equal(5n * ONE_TOKEN); // 10 - 5 (sold)
-      expect(bal2).to.equal(10n * ONE_TOKEN); // 15 - 5 (transferred)
-      expect(bal3).to.equal(8n * ONE_TOKEN); // 3 (bought) + 5 (received)
+      expect(bal1).to.equal(5n * ONE_TOKEN);
+      expect(bal2).to.equal(10n * ONE_TOKEN);
+      expect(bal3).to.equal(8n * ONE_TOKEN);
 
-      // Verify user3 has tokens from both plots
-      const user3FromPlot1 = await token.tokensFromPlot(user3.address, "GT1-COMPLEX-1");
-      const user3FromPlot2 = await token.tokensFromPlot(user3.address, "GT1-COMPLEX-2");
+      const user3FromPlot1 = await token.tokensFromPlot(
+        user3.address,
+        "GT1-COMPLEX-1"
+      );
+      const user3FromPlot2 = await token.tokensFromPlot(
+        user3.address,
+        "GT1-COMPLEX-2"
+      );
 
       expect(user3FromPlot1).to.equal(3n * ONE_TOKEN);
       expect(user3FromPlot2).to.equal(5n * ONE_TOKEN);
@@ -1055,10 +1269,8 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
         user1.address
       );
 
-      // Transfer 0 tokens (should not revert, but won't do anything meaningful)
-      await expect(
-        token.connect(user1).transfer(user2.address, 0n)
-      ).to.not.be.reverted;
+      await expect(token.connect(user1).transfer(user2.address, 0n)).to.not.be
+        .reverted;
 
       const bal1 = await token.balanceOf(user1.address);
       const bal2 = await token.balanceOf(user2.address);
@@ -1069,11 +1281,11 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
 
     it("contract can receive ETH", async () => {
       const amount = ONE_ETHER;
-      
+
       await expect(
         owner.sendTransaction({
           to: await token.getAddress(),
-          value: amount
+          value: amount,
         })
       ).to.not.be.reverted;
 
@@ -1084,7 +1296,6 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
 
   describe("Gas Efficiency Considerations", () => {
     it("handles multiple plots without excessive gas usage", async () => {
-      // Register 5 plots for user1
       for (let i = 0; i < 5; i++) {
         await token.registerLandPlot(
           `GT1-GAS-${i}`,
@@ -1103,11 +1314,9 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
         );
       }
 
-      // Transfer tokens (will iterate through plots)
       const tx = await token.connect(user1).transfer(user2.address, 5n * ONE_TOKEN);
       const receipt = await tx.wait();
 
-      // Just verify it doesn't revert - gas optimization is beyond scope of basic tests
       expect(receipt.status).to.equal(1);
     });
   });

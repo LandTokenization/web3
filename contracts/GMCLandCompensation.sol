@@ -138,6 +138,46 @@ contract GMCLandCompensation is ERC20, Ownable, ReentrancyGuard {
     );
 
     // -------------------------
+    // Inheritance / Nominee (Option A - DEMO)
+    // -------------------------
+
+    enum InheritanceStatus {
+        NONE,
+        ACTIVE, // nominee set, owner alive
+        DECEASED, // admin confirmed deceased
+        CLAIMED // nominee claimed and set new plot wallet
+    }
+
+    struct InheritancePlan {
+        address nominee;
+        InheritanceStatus status;
+        uint256 activatedAt;
+        uint256 deceasedAt;
+        uint256 claimedAt;
+    }
+
+    mapping(string => InheritancePlan) public inheritancePlans;
+
+    event NomineeSet(
+        string indexed plotId,
+        address indexed currentPlotWallet,
+        address indexed nominee
+    );
+
+    event OwnerDeclaredDeceased(
+        string indexed plotId,
+        address indexed admin,
+        address indexed nominee
+    );
+
+    event PlotClaimedByNominee(
+        string indexed plotId,
+        address indexed nominee,
+        address indexed oldWallet,
+        address newWallet
+    );
+
+    // -------------------------
     // Constructor
     // -------------------------
 
@@ -202,6 +242,88 @@ contract GMCLandCompensation is ERC20, Ownable, ReentrancyGuard {
         }
 
         super._update(from, to, value);
+    }
+
+    /**
+     * Set nominee for a plot (must be called by the plot's currently registered wallet).
+     */
+    function setNomineeForPlot(string memory plotId, address nominee) external {
+        require(nominee != address(0), "Invalid nominee");
+
+        LandPlot storage lp = plots[plotId];
+        require(lp.exists, "Plot not found");
+        require(msg.sender == lp.wallet, "Only plot wallet");
+
+        InheritancePlan storage plan = inheritancePlans[plotId];
+
+        plan.nominee = nominee;
+        plan.status = InheritanceStatus.ACTIVE;
+        plan.activatedAt = block.timestamp;
+        plan.deceasedAt = 0;
+        plan.claimedAt = 0;
+
+        emit NomineeSet(plotId, lp.wallet, nominee);
+    }
+
+    /**
+     * Admin confirms death (off-chain verification happens BEFORE calling this).
+     * After this, nominee can claim and set a new wallet for the plot record.
+     */
+    function declarePlotOwnerDeceased(string memory plotId) external onlyOwner {
+        LandPlot storage lp = plots[plotId];
+        require(lp.exists, "Plot not found");
+
+        InheritancePlan storage plan = inheritancePlans[plotId];
+        require(plan.status == InheritanceStatus.ACTIVE, "No active nominee");
+        require(plan.nominee != address(0), "Nominee not set");
+
+        plan.status = InheritanceStatus.DECEASED;
+        plan.deceasedAt = block.timestamp;
+
+        emit OwnerDeclaredDeceased(plotId, msg.sender, plan.nominee);
+    }
+
+    /**
+     * Nominee claims plot record and sets a new wallet.
+     * This updates lp.wallet and indexes plot under the new wallet.
+     * NOTE: This does NOT move ERC20 tokens from the old wallet.
+     */
+    function claimPlotAsNominee(
+        string memory plotId,
+        address newWallet
+    ) external {
+        require(newWallet != address(0), "Invalid new wallet");
+
+        LandPlot storage lp = plots[plotId];
+        require(lp.exists, "Plot not found");
+
+        InheritancePlan storage plan = inheritancePlans[plotId];
+        require(plan.status == InheritanceStatus.DECEASED, "Not claimable");
+        require(msg.sender == plan.nominee, "Only nominee");
+
+        address oldWallet = lp.wallet;
+
+        // update plot wallet record
+        lp.wallet = newWallet;
+        walletPlots[newWallet].push(plotId);
+
+        plan.status = InheritanceStatus.CLAIMED;
+        plan.claimedAt = block.timestamp;
+
+        emit PlotClaimedByNominee(plotId, msg.sender, oldWallet, newWallet);
+    }
+
+    function clearNomineeForPlot(string memory plotId) external {
+        LandPlot storage lp = plots[plotId];
+        require(lp.exists, "Plot not found");
+        require(msg.sender == lp.wallet, "Only plot wallet");
+
+        InheritancePlan storage plan = inheritancePlans[plotId];
+        plan.nominee = address(0);
+        plan.status = InheritanceStatus.NONE;
+        plan.activatedAt = 0;
+        plan.deceasedAt = 0;
+        plan.claimedAt = 0;
     }
 
     // -------------------------
