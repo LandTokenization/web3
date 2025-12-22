@@ -326,6 +326,56 @@ contract GMCLandCompensation is ERC20, Ownable, ReentrancyGuard {
         plan.claimedAt = 0;
     }
 
+    /**
+     * Nominee claims plot AND transfers plot-tagged tokens to new wallet.
+     * - Burns tokensFromPlot[oldWallet][plotId] from old wallet (admin power)
+     * - Mints same amount to newWallet
+     * - Updates tokensFromPlot mapping
+     *
+     * NOTE:
+     * - This ONLY moves tokens that are currently tagged to this plot in tokensFromPlot.
+     * - If old wallet sold tokens, nominee only gets what remains.
+     */
+    function claimPlotAsNomineeWithTokens(
+        string memory plotId,
+        address newWallet
+    ) external {
+        require(newWallet != address(0), "Invalid new wallet");
+
+        LandPlot storage lp = plots[plotId];
+        require(lp.exists, "Plot not found");
+
+        InheritancePlan storage plan = inheritancePlans[plotId];
+        require(plan.status == InheritanceStatus.DECEASED, "Not claimable");
+        require(msg.sender == plan.nominee, "Only nominee");
+
+        address oldWallet = lp.wallet;
+
+        // 1) Transfer the plot-tagged tokens via burn+mint (DEMO admin power)
+        uint256 amount = tokensFromPlot[oldWallet][plotId];
+
+        if (amount > 0) {
+            // burn from old wallet (requires oldWallet has enough balance)
+            _burn(oldWallet, amount);
+
+            // clear old plot-tagged balance
+            tokensFromPlot[oldWallet][plotId] = 0;
+
+            // mint to new wallet and tag to plot
+            _mint(newWallet, amount);
+            _addTokensFromPlot(newWallet, plotId, amount);
+        }
+
+        // 2) update plot wallet record + indexing
+        lp.wallet = newWallet;
+        walletPlots[newWallet].push(plotId);
+
+        plan.status = InheritanceStatus.CLAIMED;
+        plan.claimedAt = block.timestamp;
+
+        emit PlotClaimedByNominee(plotId, msg.sender, oldWallet, newWallet);
+    }
+
     // -------------------------
     // Land Plot Functions (ADMIN)
     // -------------------------
