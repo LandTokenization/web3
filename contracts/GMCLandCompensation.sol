@@ -192,6 +192,8 @@ contract GMCLandCompensation is ERC20, Ownable, ReentrancyGuard {
     // Internal helpers for plot-token tracking
     // -------------------------
 
+    bool private _skipPlotMove;
+
     function _addTokensFromPlot(
         address account,
         string memory plotId,
@@ -232,17 +234,7 @@ contract GMCLandCompensation is ERC20, Ownable, ReentrancyGuard {
     }
 
     // Override ERC20 internal hook to keep per-plot balances in sync on transfers
-    function _update(
-        address from,
-        address to,
-        uint256 value
-    ) internal override {
-        if (from != address(0) && to != address(0) && value > 0) {
-            _moveTokensAcrossPlots(from, to, value);
-        }
-
-        super._update(from, to, value);
-    }
+    // (Kept as reference but actual implementation is below after _transferFromPlot)
 
     /**
      * Set nominee for a plot (must be called by the plot's currently registered wallet).
@@ -252,7 +244,10 @@ contract GMCLandCompensation is ERC20, Ownable, ReentrancyGuard {
 
         LandPlot storage lp = plots[plotId];
         require(lp.exists, "Plot not found");
-        require(msg.sender == lp.wallet, "Only plot wallet");
+        require(
+            msg.sender == owner() || msg.sender == lp.wallet,
+            "Not authorized"
+        );
 
         InheritancePlan storage plan = inheritancePlans[plotId];
 
@@ -316,7 +311,10 @@ contract GMCLandCompensation is ERC20, Ownable, ReentrancyGuard {
     function clearNomineeForPlot(string memory plotId) external {
         LandPlot storage lp = plots[plotId];
         require(lp.exists, "Plot not found");
-        require(msg.sender == lp.wallet, "Only plot wallet");
+        require(
+            msg.sender == owner() || msg.sender == lp.wallet,
+            "Not authorized"
+        );
 
         InheritancePlan storage plan = inheritancePlans[plotId];
         plan.nominee = address(0);
@@ -481,6 +479,98 @@ contract GMCLandCompensation is ERC20, Ownable, ReentrancyGuard {
     }
 
     // -------------------------
+    // Marketplace (Plot-linked Sell Orders)
+    // -------------------------
+
+    // orderId => plotId (only for plot-linked orders)
+    mapping(uint256 => string) public orderPlotId;
+    mapping(uint256 => bool) public orderHasPlot;
+
+    event SellOrderCreatedWithPlot(
+        uint256 indexed orderId,
+        address indexed seller,
+        string indexed plotId,
+        uint256 amount,
+        uint256 pricePerTokenWei
+    );
+
+    function _update(
+        address from,
+        address to,
+        uint256 value
+    ) internal override {
+        // If we manually manage plot-token movement, skip the auto traversal.
+        if (!_skipPlotMove) {
+            if (from != address(0) && to != address(0) && value > 0) {
+                _moveTokensAcrossPlots(from, to, value);
+            }
+        }
+
+        super._update(from, to, value);
+    }
+
+    function _transferFromPlot(
+        address from,
+        address to,
+        string memory plotId,
+        uint256 amount
+    ) internal {
+        require(amount > 0, "Amount must be > 0");
+        require(
+            tokensFromPlot[from][plotId] >= amount,
+            "Not enough tokens from plot"
+        );
+
+        // Move ERC20 balances without triggering _moveTokensAcrossPlots()
+        _skipPlotMove = true;
+        super._update(from, to, amount);
+        _skipPlotMove = false;
+
+        // Manually move plot-tagged balances
+        tokensFromPlot[from][plotId] -= amount;
+        _addTokensFromPlot(to, plotId, amount);
+    }
+
+    function createSellOrderForPlot(
+        string memory plotId,
+        uint256 amount,
+        uint256 pricePerTokenWei
+    ) external nonReentrant returns (uint256 orderId) {
+        require(pricePerTokenWei > 0, "Price must be > 0");
+
+        LandPlot storage lp = plots[plotId];
+        require(lp.exists, "Plot not found");
+
+        // Take ONLY tokens originating from this plot into contract custody
+        _transferFromPlot(msg.sender, address(this), plotId, amount);
+
+        orderId = nextOrderId;
+        nextOrderId++;
+
+        sellOrders[orderId] = SellOrder({
+            id: orderId,
+            seller: msg.sender,
+            amountTotal: amount,
+            amountRemaining: amount,
+            pricePerTokenWei: pricePerTokenWei,
+            active: true
+        });
+
+        // attach plot info
+        orderHasPlot[orderId] = true;
+        orderPlotId[orderId] = plotId;
+
+        emit SellOrderCreatedWithPlot(
+            orderId,
+            msg.sender,
+            plotId,
+            amount,
+            pricePerTokenWei
+        );
+        emit SellOrderCreated(orderId, msg.sender, amount, pricePerTokenWei); // optional (keep old event consumers)
+    }
+
+    // -------------------------
     // Marketplace: Sell Orders
     // -------------------------
 
@@ -530,7 +620,12 @@ contract GMCLandCompensation is ERC20, Ownable, ReentrancyGuard {
         }
 
         // Transfer tokens from contract to buyer.
-        _transfer(address(this), msg.sender, amountToBuy);
+        if (orderHasPlot[orderId]) {
+            string memory pid = orderPlotId[orderId];
+            _transferFromPlot(address(this), msg.sender, pid, amountToBuy);
+        } else {
+            _transfer(address(this), msg.sender, amountToBuy);
+        }
 
         // Track ETH and token volumes
         totalProceeds[order.seller] += totalCost;
@@ -562,7 +657,19 @@ contract GMCLandCompensation is ERC20, Ownable, ReentrancyGuard {
         order.amountRemaining = 0;
 
         if (remaining > 0) {
-            _transfer(address(this), msg.sender, remaining);
+            if (remaining > 0) {
+                if (orderHasPlot[orderId]) {
+                    string memory pid = orderPlotId[orderId];
+                    _transferFromPlot(
+                        address(this),
+                        msg.sender,
+                        pid,
+                        remaining
+                    );
+                } else {
+                    _transfer(address(this), msg.sender, remaining);
+                }
+            }
         }
 
         emit SellOrderCancelled(orderId, msg.sender, remaining);

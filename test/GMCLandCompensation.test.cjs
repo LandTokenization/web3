@@ -1579,4 +1579,401 @@ describe("GMCLandCompensation - Comprehensive Tests", function () {
       expect(order.amountRemaining).to.equal(0n);
     });
   });
+
+  describe("Plot-Linked Sell Orders (createSellOrderForPlot)", () => {
+    beforeEach(async () => {
+      await token.registerLandPlot(
+        "GT1-PLOT-ORDER",
+        "Gelephu",
+        "Gelephu Throm",
+        "7777",
+        "Seller",
+        "77777777777",
+        "Individual",
+        "Private",
+        "Urban Core",
+        "CLASS A",
+        500n,
+        10n,
+        user1.address
+      );
+    });
+
+    it("createSellOrderForPlot creates order for specific plot only", async () => {
+      const amountToSell = 6n * ONE_TOKEN;
+      const pricePerTokenWei = ONE_ETHER;
+
+      const tx = await token
+        .connect(user1)
+        .createSellOrderForPlot("GT1-PLOT-ORDER", amountToSell, pricePerTokenWei);
+      const rc = await tx.wait();
+      const event = rc.logs.find(
+        (l) => l.fragment && l.fragment.name === "SellOrderCreatedWithPlot"
+      );
+      const orderId = event.args[0]; // orderId is first arg
+
+      const order = await token.sellOrders(orderId);
+      expect(order.active).to.equal(true);
+      expect(order.amountRemaining).to.equal(amountToSell);
+      expect(order.seller).to.equal(user1.address);
+
+      const hasPlot = await token.orderHasPlot(orderId);
+      const plotId = await token.orderPlotId(orderId);
+      expect(hasPlot).to.equal(true);
+      expect(plotId).to.equal("GT1-PLOT-ORDER");
+
+      const fromPlotSeller = await token.tokensFromPlot(
+        user1.address,
+        "GT1-PLOT-ORDER"
+      );
+      expect(fromPlotSeller).to.equal(10n * ONE_TOKEN - amountToSell);
+    });
+
+    it("reverts when creating plot order from non-existent plot", async () => {
+      await expect(
+        token
+          .connect(user1)
+          .createSellOrderForPlot("FAKE-PLOT", ONE_TOKEN, ONE_ETHER)
+      ).to.be.revertedWith("Plot not found");
+    });
+
+    it("buyFromOrder for plot-linked order transfers plot-tagged tokens", async () => {
+      const amountToSell = 4n * ONE_TOKEN;
+      const pricePerTokenWei = ONE_ETHER;
+
+      const tx = await token
+        .connect(user1)
+        .createSellOrderForPlot("GT1-PLOT-ORDER", amountToSell, pricePerTokenWei);
+      const rc = await tx.wait();
+      const event = rc.logs.find(
+        (l) => l.fragment && l.fragment.name === "SellOrderCreatedWithPlot"
+      );
+      const orderId = event.args.orderId;
+
+      const totalCost = (amountToSell * pricePerTokenWei) / DECIMALS_FACTOR;
+
+      await token
+        .connect(user2)
+        .buyFromOrder(orderId, amountToSell, { value: totalCost });
+
+      const buyerFromPlot = await token.tokensFromPlot(
+        user2.address,
+        "GT1-PLOT-ORDER"
+      );
+      expect(buyerFromPlot).to.equal(amountToSell);
+
+      const order = await token.sellOrders(orderId);
+      expect(order.active).to.equal(false);
+    });
+
+    it("cancelSellOrder for plot-linked order returns plot tokens", async () => {
+      const amountToSell = 5n * ONE_TOKEN;
+      const pricePerTokenWei = ONE_ETHER;
+
+      const tx = await token
+        .connect(user1)
+        .createSellOrderForPlot("GT1-PLOT-ORDER", amountToSell, pricePerTokenWei);
+      const rc = await tx.wait();
+      const event = rc.logs.find(
+        (l) => l.fragment && l.fragment.name === "SellOrderCreatedWithPlot"
+      );
+      const orderId = event.args.orderId;
+
+      await expect(token.connect(user1).cancelSellOrder(orderId))
+        .to.emit(token, "SellOrderCancelled")
+        .withArgs(orderId, user1.address, amountToSell);
+
+      const fromPlot = await token.tokensFromPlot(
+        user1.address,
+        "GT1-PLOT-ORDER"
+      );
+      expect(fromPlot).to.equal(10n * ONE_TOKEN);
+    });
+  });
+
+  describe("Inheritance - claimPlotAsNomineeWithTokens", () => {
+    beforeEach(async () => {
+      await token.registerLandPlot(
+        "GT1-INHERIT-TOKEN",
+        "Gelephu",
+        "Gelephu Throm",
+        "8888",
+        "Original Owner",
+        "88888888888",
+        "Family",
+        "Private",
+        "Urban Core",
+        "CLASS A",
+        510n,
+        8n,
+        user1.address
+      );
+    });
+
+    it("claimPlotAsNomineeWithTokens transfers plot-tagged tokens to new wallet", async () => {
+      const totalTokens = 8n * ONE_TOKEN;
+
+      await token.connect(user1).setNomineeForPlot("GT1-INHERIT-TOKEN", user2.address);
+      await token.declarePlotOwnerDeceased("GT1-INHERIT-TOKEN");
+
+      await expect(
+        token.connect(user2).claimPlotAsNomineeWithTokens("GT1-INHERIT-TOKEN", user3.address)
+      )
+        .to.emit(token, "PlotClaimedByNominee")
+        .withArgs("GT1-INHERIT-TOKEN", user2.address, user1.address, user3.address);
+
+      const plot = await token.plots("GT1-INHERIT-TOKEN");
+      expect(plot.wallet).to.equal(user3.address);
+
+      const balUser1 = await token.balanceOf(user1.address);
+      const balUser3 = await token.balanceOf(user3.address);
+
+      expect(balUser1).to.equal(0n);
+      expect(balUser3).to.equal(totalTokens);
+
+      const fromPlotUser3 = await token.tokensFromPlot(
+        user3.address,
+        "GT1-INHERIT-TOKEN"
+      );
+      expect(fromPlotUser3).to.equal(totalTokens);
+    });
+
+    it("claimPlotAsNomineeWithTokens only transfers remaining tokens if some were sold", async () => {
+      const totalTokens = 8n * ONE_TOKEN;
+      const soldAmount = 3n * ONE_TOKEN;
+
+      // User1 sells some tokens
+      const tx = await token
+        .connect(user1)
+        .createSellOrder(soldAmount, ONE_ETHER);
+      const rc = await tx.wait();
+      const event = rc.logs.find(
+        (l) => l.fragment && l.fragment.name === "SellOrderCreated"
+      );
+      const orderId = event.args.orderId;
+
+      await token
+        .connect(user2)
+        .buyFromOrder(orderId, soldAmount, { value: (soldAmount * ONE_ETHER) / DECIMALS_FACTOR });
+
+      // Now user1 has fewer tokens
+      const balUser1Before = await token.balanceOf(user1.address);
+      expect(balUser1Before).to.equal(totalTokens - soldAmount);
+
+      // Set nominee and claim
+      await token.connect(user1).setNomineeForPlot("GT1-INHERIT-TOKEN", user2.address);
+      await token.declarePlotOwnerDeceased("GT1-INHERIT-TOKEN");
+
+      await token.connect(user2).claimPlotAsNomineeWithTokens("GT1-INHERIT-TOKEN", user3.address);
+
+      const fromPlotUser3 = await token.tokensFromPlot(
+        user3.address,
+        "GT1-INHERIT-TOKEN"
+      );
+      expect(fromPlotUser3).to.equal(totalTokens - soldAmount);
+    });
+
+    it("reverts when non-nominee calls claimPlotAsNomineeWithTokens", async () => {
+      await token.connect(user1).setNomineeForPlot("GT1-INHERIT-TOKEN", user2.address);
+      await token.declarePlotOwnerDeceased("GT1-INHERIT-TOKEN");
+
+      await expect(
+        token.connect(user3).claimPlotAsNomineeWithTokens("GT1-INHERIT-TOKEN", user3.address)
+      ).to.be.revertedWith("Only nominee");
+    });
+
+    it("reverts when claiming before deceased declaration", async () => {
+      await token.connect(user1).setNomineeForPlot("GT1-INHERIT-TOKEN", user2.address);
+
+      await expect(
+        token.connect(user2).claimPlotAsNomineeWithTokens("GT1-INHERIT-TOKEN", user3.address)
+      ).to.be.revertedWith("Not claimable");
+    });
+  });
+
+  describe("Inheritance - clearNomineeForPlot", () => {
+    beforeEach(async () => {
+      await token.registerLandPlot(
+        "GT1-CLEAR-NOMINEE",
+        "Gelephu",
+        "Gelephu Throm",
+        "9999",
+        "Owner",
+        "99999999999",
+        "Family",
+        "Private",
+        "Urban Core",
+        "CLASS B",
+        510n,
+        5n,
+        user1.address
+      );
+    });
+
+    it("clearNomineeForPlot removes nominee from plot", async () => {
+      await token.connect(user1).setNomineeForPlot("GT1-CLEAR-NOMINEE", user2.address);
+
+      let plan = await token.inheritancePlans("GT1-CLEAR-NOMINEE");
+      expect(plan.nominee).to.equal(user2.address);
+      expect(plan.status).to.equal(1n); // ACTIVE
+
+      await token.connect(user1).clearNomineeForPlot("GT1-CLEAR-NOMINEE");
+
+      plan = await token.inheritancePlans("GT1-CLEAR-NOMINEE");
+      expect(plan.nominee).to.equal(ethers.ZeroAddress);
+      expect(plan.status).to.equal(0n); // NONE
+    });
+
+    it("reverts when non-plot-wallet tries to clear nominee", async () => {
+      await token.connect(user1).setNomineeForPlot("GT1-CLEAR-NOMINEE", user2.address);
+
+      await expect(
+        token.connect(user3).clearNomineeForPlot("GT1-CLEAR-NOMINEE")
+      ).to.be.revertedWith("Only plot wallet");
+    });
+
+    it("reverts when clearing nominee for non-existent plot", async () => {
+      await expect(
+        token.connect(user1).clearNomineeForPlot("FAKE-PLOT")
+      ).to.be.revertedWith("Plot not found");
+    });
+  });
+
+  describe("Dashboard Helper Functions", () => {
+    beforeEach(async () => {
+      await token.registerLandPlot(
+        "GT1-DASH-1",
+        "Gelephu",
+        "Gelephu Throm",
+        "1111",
+        "Owner A",
+        "11111111111",
+        "Family",
+        "Private",
+        "Urban Core",
+        "CLASS A",
+        500n,
+        5n,
+        user1.address
+      );
+
+      await token.registerLandPlot(
+        "GT1-DASH-2",
+        "Gelephu",
+        "Gelephu Throm",
+        "2222",
+        "Owner B",
+        "22222222222",
+        "Family",
+        "Private",
+        "Urban Core",
+        "CLASS B",
+        600n,
+        7n,
+        user2.address
+      );
+    });
+
+    it("getWalletPlots returns all plots for a wallet", async () => {
+      const plots = await token.getWalletPlots(user1.address);
+      expect(plots.length).to.be.greaterThan(0);
+      expect(plots).to.include("GT1-DASH-1");
+    });
+
+    it("getAllPlotIds returns all registered plots", async () => {
+      const allPlots = await token.getAllPlotIds();
+      expect(allPlots.length).to.be.greaterThan(0);
+      expect(allPlots).to.include("GT1-DASH-1");
+      expect(allPlots).to.include("GT1-DASH-2");
+    });
+
+    it("getPlotCount returns correct count of plots", async () => {
+      const count = await token.getPlotCount();
+      const allPlots = await token.getAllPlotIds();
+      expect(count).to.equal(allPlots.length);
+    });
+
+    it("getPlotIdAt returns plot at specific index", async () => {
+      const plotAt0 = await token.getPlotIdAt(0);
+      expect(plotAt0).to.be.a("string");
+      expect(plotAt0.length).to.be.greaterThan(0);
+    });
+
+    it("reverts when getPlotIdAt index is out of bounds", async () => {
+      const count = await token.getPlotCount();
+      const outOfBoundsIndex = Number(count) + 100;
+      await expect(token.getPlotIdAt(outOfBoundsIndex)).to.be.revertedWith(
+        "Index out of bounds"
+      );
+    });
+
+    it("isPlotIndexed returns true for indexed plots", async () => {
+      const isIndexed = await token.isPlotIndexed("GT1-DASH-1");
+      expect(isIndexed).to.equal(true);
+    });
+
+    it("isPlotIndexed returns false for non-indexed plots", async () => {
+      const isIndexed = await token.isPlotIndexed("FAKE-PLOT");
+      expect(isIndexed).to.equal(false);
+    });
+  });
+
+  describe("Admin Dashboard Functions", () => {
+    beforeEach(async () => {
+      await token.registerLandPlot(
+        "GT1-ADMIN-1",
+        "Gelephu",
+        "Gelephu Throm",
+        "3333",
+        "Owner",
+        "33333333333",
+        "Family",
+        "Private",
+        "Urban Core",
+        "CLASS A",
+        500n,
+        10n,
+        user1.address
+      );
+
+      await token.registerLandPlot(
+        "GT1-ADMIN-2",
+        "Gelephu",
+        "Gelephu Throm",
+        "4444",
+        "Owner",
+        "44444444444",
+        "Family",
+        "Private",
+        "Urban Core",
+        "CLASS B",
+        600n,
+        8n,
+        user2.address
+      );
+    });
+
+    it("getAllPlotsForAdmin returns all plots with correct details", async () => {
+      const allPlots = await token.getAllPlotsForAdmin();
+      expect(allPlots.length).to.be.greaterThan(0);
+
+      const plot1 = allPlots.find((p) => p.plotId === "GT1-ADMIN-1");
+      expect(plot1).to.exist;
+      expect(plot1.ownerName).to.equal("Owner");
+      expect(plot1.landValue).to.equal(10n);
+      expect(plot1.wallet).to.equal(user1.address);
+    });
+
+    it("getAllPlotsForAdmin includes allocatedTokens for each plot", async () => {
+      const allPlots = await token.getAllPlotsForAdmin();
+      const plot1 = allPlots.find((p) => p.plotId === "GT1-ADMIN-1");
+      expect(plot1.allocatedTokens).to.equal(10n * ONE_TOKEN);
+    });
+
+    it("getAllPlotsForAdmin myTokensFromThisPlot is zero", async () => {
+      const allPlots = await token.getAllPlotsForAdmin();
+      const plot1 = allPlots.find((p) => p.plotId === "GT1-ADMIN-1");
+      expect(plot1.myTokensFromThisPlot).to.equal(0n);
+    });
+  });
 });
